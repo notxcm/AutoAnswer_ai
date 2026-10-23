@@ -1,0 +1,17 @@
+# 本地工具配置（Claude Code / CodeArts 等），绝不提交
+.claude/
+.codeartsdoer/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 运行时自动生成
+capture_region.json
+run*.log
+*.log
+
+# 本地密钥 / 环境变量（如需单独保存 API Key）
+config_local.py
+.env
