@@ -9,6 +9,7 @@ import re
 import json
 import time
 import logging
+import threading
 from typing import Optional, Dict
 
 from PIL import Image
@@ -111,7 +112,12 @@ class HotkeyHandler(QObject):
         try:
             import keyboard
             keyboard.add_hotkey(HOTKEY_SELECT, lambda: self.select_region_signal.emit())
-            keyboard.add_hotkey(HOTKEY_PAUSE, lambda: self.toggle_pause_signal.emit())
+            # 切换类热键在松开时触发，避免按住不放时被键盘重复事件反复切换
+            keyboard.add_hotkey(
+                HOTKEY_PAUSE,
+                lambda: self.toggle_pause_signal.emit(),
+                trigger_on_release=True,
+            )
             keyboard.add_hotkey(HOTKEY_CAPTURE, lambda: self.capture_signal.emit())
             keyboard.add_hotkey(HOTKEY_EXIT, lambda: self.exit_signal.emit())
             logger.info(f"热键已注册: {HOTKEY_SELECT}, {HOTKEY_PAUSE}, {HOTKEY_CAPTURE}, {HOTKEY_EXIT}")
@@ -130,6 +136,8 @@ class CaptureThread(QThread):
         self.paused = True
         self.single_shot = False
         self.sct = None
+        # 用于打断 sleep，让暂停/继续、单次识别立即生效
+        self._wake = threading.Event()
 
         # OCR和AI将在run中初始化
         self.ocr = None
@@ -190,13 +198,14 @@ class CaptureThread(QThread):
 捕获区域: {self.region}
 快捷键:
   • Ctrl+F1 = 重新框选区域
-  • Ctrl+F2 = 暂停/继续
+  • Ctrl+F2 = 暂停/继续（启动时默认暂停）
   • Ctrl+F3 = 手动识别一次 ⚡
   • Ctrl+Q  = 退出程序
 {'='*50}
 """)
 
             while self.running:
+                self._wake.clear()
                 if self.single_shot:
                     self.single_shot = False
                     try:
@@ -208,7 +217,8 @@ class CaptureThread(QThread):
                         self._process_frame(force=False)
                     except Exception as e:
                         logger.error(f"处理帧时出错: {e}")
-                time.sleep(SCAN_INTERVAL)
+                # 可被 pause()/trigger_capture()/stop() 立即唤醒
+                self._wake.wait(SCAN_INTERVAL)
 
         except Exception as e:
             logger.error(f"捕获线程异常: {e}")
@@ -394,13 +404,7 @@ class CaptureThread(QThread):
             logger.debug("   解析: %s", detail[:50])
 
         self.result_signal.emit(result)
-
-        runtime = time.time() - self.start_time
-        stats = (
-            f"运行: {int(runtime)}s | API: {self.api_count}次 | "
-            f"视觉: {self.vision_count}次 | 回退: {self.fallback_count}次"
-        )
-        self.status_signal.emit(stats)
+        self.status_signal.emit(self.status_text())
 
     def _emit_error(self, detail: str):
         logger.error(detail)
@@ -425,19 +429,36 @@ class CaptureThread(QThread):
         self.vision_disabled_until = 0.0
         logger.info(f"捕获区域已更新: {new_region}")
 
+    def set_paused(self, paused: bool):
+        """设置暂停状态，并唤醒捕获线程立即响应。"""
+        if self.paused != paused:
+            self.paused = paused
+            self._wake.set()
+
     def pause(self) -> bool:
-        """切换暂停状态"""
-        self.paused = not self.paused
+        """切换暂停状态，返回切换后的状态。"""
+        self.set_paused(not self.paused)
         return self.paused
 
     def stop(self):
         """停止线程"""
         self.running = False
+        self._wake.set()
         logger.info("正在停止捕获线程...")
 
     def trigger_capture(self):
         """触发一次识别"""
         self.single_shot = True
+        self._wake.set()
+
+    def status_text(self) -> str:
+        """状态栏文本：始终包含当前扫描状态。"""
+        runtime = time.time() - self.start_time
+        state = "⏸ 已暂停" if self.paused else "▶ 连续扫描"
+        return (
+            f"{state} | 运行: {int(runtime)}s | API: {self.api_count}次 | "
+            f"视觉: {self.vision_count}次 | 回退: {self.fallback_count}次"
+        )
 
 
 class AutoAnswerApp:
@@ -454,6 +475,10 @@ class AutoAnswerApp:
         self.thread.result_signal.connect(self.overlay.show_answer)
         self.thread.status_signal.connect(self.overlay.update_status)
 
+        # 热键状态：防止重复触发 / 框选期间误切换
+        self._last_pause_toggle = 0.0
+        self._selecting_region = False
+
         # 初始化热键处理器（线程安全）
         self.hotkey_handler = HotkeyHandler()
         self.hotkey_handler.select_region_signal.connect(self._on_select_region)
@@ -464,11 +489,14 @@ class AutoAnswerApp:
 
         # 启动线程
         self.thread.start()
-        self.overlay.update_status("状态：按 Ctrl+F3 开始识别")
+        self.overlay.update_status("⏸ 已暂停 | Ctrl+F2 开始连续扫描 | Ctrl+F3 单次识别")
         logger.info("应用启动完成")
 
     def _on_capture(self):
         """手动触发一次识别（主线程）"""
+        if self._selecting_region:
+            self.overlay.show_message("正在框选区域，请稍候")
+            return
         logger.info("⚡ 手动触发识别...")
         self.overlay.show_message("正在识别...")
         self.thread.trigger_capture()
@@ -476,8 +504,10 @@ class AutoAnswerApp:
     def _on_select_region(self):
         """重新框选区域（在主线程执行）"""
         logger.info("触发区域选择...")
+        self._selecting_region = True
         was_paused = self.thread.paused
-        self.thread.paused = True
+        self.thread.set_paused(True)
+        self.overlay.update_status("⏸ 正在框选区域...")
 
         print("\n" + "=" * 40)
         print("请框选要捕获的屏幕区域...")
@@ -485,7 +515,7 @@ class AutoAnswerApp:
 
         try:
             import subprocess
-            result = subprocess.run(
+            subprocess.run(
                 [sys.executable, REGION_SELECTOR_SCRIPT],
                 timeout=60
             )
@@ -504,16 +534,29 @@ class AutoAnswerApp:
             logger.error(f"区域选择失败: {e}")
             self.overlay.show_message("选择失败 ✗")
         finally:
-            if not was_paused:
-                self.thread.paused = False
+            self._selecting_region = False
+            # 恢复框选前的扫描状态（框选期间 Ctrl+F2 不生效）
+            self.thread.set_paused(was_paused)
+            self.overlay.update_status(self.thread.status_text())
 
     def _on_toggle_pause(self):
         """切换暂停状态（主线程）"""
+        if self._selecting_region:
+            self.overlay.show_message("正在框选区域，暂不能切换扫描状态")
+            return
+
+        # 防抖：避免松开热键时产生重复信号
+        now = time.time()
+        if now - self._last_pause_toggle < 0.25:
+            return
+        self._last_pause_toggle = now
+
         is_paused = self.thread.pause()
         if is_paused:
-            status = "已暂停 ⏸ | 按 F3 手动识别"
+            status = "已暂停 ⏸ | Ctrl+F2 继续 | Ctrl+F3 单次识别"
         else:
-            status = "连续扫描中 ▶ | 按 F2 停止"
+            status = "连续扫描中 ▶ | Ctrl+F2 暂停"
+        self.overlay.update_status(self.thread.status_text())
         self.overlay.show_message(status)
         logger.info(status)
 

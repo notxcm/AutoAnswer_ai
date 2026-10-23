@@ -50,6 +50,14 @@ class AnswerOverlay(QWidget):
         layout.addWidget(self.status_label)
         self.setLayout(layout)
 
+        # 让鼠标事件穿透子标签，整块悬浮窗都可拖拽
+        for label in (self.answer_label, self.detail_label, self.status_label):
+            label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        # 拖拽状态与光标提示
+        self._drag_offset = None
+        self.setCursor(Qt.OpenHandCursor)
+
         self.resize(300, 120)
 
         # 连接信号
@@ -70,6 +78,41 @@ class AnswerOverlay(QWidget):
         painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(self.rect(), self._border_radius, self._border_radius)
+
+    # ---------- 拖拽移动 ----------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = event.globalPos() - self.frameGeometry().topLeft()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            self._move_within_screen(
+                event.globalPos() - self._drag_offset,
+                event.globalPos(),
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = None
+            self.setCursor(Qt.OpenHandCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _move_within_screen(self, target_pos, cursor_pos):
+        """移动窗口，并保证窗口不会被拖出当前屏幕。"""
+        screen = QApplication.screenAt(cursor_pos) or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = max(area.left(), min(target_pos.x(), area.right() - self.width() + 1))
+        y = max(area.top(), min(target_pos.y(), area.bottom() - self.height() + 1))
+        self.move(x, y)
 
     def show_answer(self, answer_data: dict):
         """显示答案（线程安全）"""
