@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 
+from answer_utils import normalize_option_label
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -21,18 +23,9 @@ logger = logging.getLogger(__name__)
 class OCREngine:
     """RapidOCR engine: ONNX Runtime backend, lightweight and fast."""
 
-    CIRCLED_NUM_MAP: Dict[str, str] = {
-        '①': '1', '②': '2', '③': '3', '④': '4', '⑤': '5',
-        '⑥': '6', '⑦': '7', '⑧': '8', '⑨': '9', '⑩': '10',
-        '⑪': '11', '⑫': '12', '⑬': '13', '⑭': '14', '⑮': '15',
-        '⑯': '16', '⑰': '17', '⑱': '18', '⑲': '19', '⑳': '20',
-    }
-    CN_NUM_MAP: Dict[str, str] = {
-        '一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
-        '六': '6', '七': '7', '八': '8', '九': '9', '十': '10',
-    }
     OPTION_LINE_RE = re.compile(
-        r'^\s*(?P<label>[A-Za-z]|\d{1,2}|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]|'
+        r'^\s*(?:[☐□☑✔√■]\s*)?'
+        r'(?P<label>[A-Za-z]|\d{1,2}|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]|'
         r'[一二三四五六七八九十])\s*[\.\、．:：\)）]\s*(?P<content>.+?)\s*$'
     )
     INLINE_LETTER_OPTION_RE = re.compile(
@@ -50,6 +43,11 @@ class OCREngine:
         '判断题', '判断下列', '对错', '是否正确', '是否错误',
         '是非题'
     )
+    MULTIPLE_CHOICE_HINTS: Tuple[str, ...] = (
+        '多选题', '多选', '多项选择', '不定项', '至少两项',
+        '全部正确', '选出所有',
+    )
+    CHECKBOX_GLYPHS = '□☐'
     OPTION_PATTERNS: Dict[str, List[str]] = {
         'A': [
             r'A[．、.、:：]\s*(.+?)(?=(?:[B-D][．、.、:：]|\Z))',
@@ -233,14 +231,7 @@ class OCREngine:
         return lines
 
     def _normalize_option_label(self, label: str) -> str:
-        label = label.strip()
-        if label in self.CIRCLED_NUM_MAP:
-            return self.CIRCLED_NUM_MAP[label]
-        if label in self.CN_NUM_MAP:
-            return self.CN_NUM_MAP[label]
-        if label.isalpha():
-            return label.upper()
-        return label
+        return normalize_option_label(label)
 
     def _extract_options_from_lines(
         self, lines: List[str]
@@ -341,9 +332,22 @@ class OCREngine:
             return "true_false"
         if self._is_fill_blank_question(combined_text, options):
             return "fill_blank"
+        if self._is_multiple_choice_question(question, options, combined_text):
+            return "multiple_choice"
         if options:
-            return "choice"
+            return "single_choice"
         return "open_ended"
+
+    def _is_multiple_choice_question(
+        self, question: str, options: Dict[str, str], combined_text: str
+    ) -> bool:
+        """保守判断多选：仅凭明确提示词或复选框符号，不单看“全部/正确的有”。"""
+        if len(options) < 2:
+            return False
+        if any(hint in combined_text for hint in self.MULTIPLE_CHOICE_HINTS):
+            return True
+        checkbox_count = sum(combined_text.count(c) for c in self.CHECKBOX_GLYPHS)
+        return checkbox_count >= 2
 
     def _is_true_false_question(
         self, question: str, options: Dict[str, str], combined_text: str
@@ -378,7 +382,7 @@ class OCREngine:
         self, question: str, options: Dict[str, str], question_type: str
     ) -> bool:
         question_length = len(question.replace('\n', '').strip())
-        if question_type == "choice":
+        if question_type in ("choice", "single_choice", "multiple_choice"):
             return question_length >= 4 and len(options) >= 2
         if question_type == "true_false":
             return question_length >= 4
