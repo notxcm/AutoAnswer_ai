@@ -76,7 +76,10 @@ class AnswerOverlay(QWidget):
         self._show_answer_signal.emit(answer_data)
 
     def _do_show_answer(self, answer_data: dict):
-        answer = answer_data.get("answer", "?")
+        answer = str(answer_data.get("answer", "?"))
+        # 多选答案 A,C 展示为更符合中文习惯的 A、C
+        if answer.count(",") >= 1 and len(answer) <= 16:
+            answer = answer.replace(",", "、")
         detail = answer_data.get("detail", "")
         source = answer_data.get("source", "")
         self.answer_label.setText(f"答案：{answer}")
